@@ -593,7 +593,7 @@ enum PlatformScheduler {
         }
     }
 
-    private func _posixTimespec(_ time: FileTime) -> timespec {
+    func _posixTimespec(_ time: FileTime) -> timespec {
         switch time.representation {
         case .absolute(let seconds, let nanoseconds):
             return timespec(tv_sec: time_t(seconds), tv_nsec: Int(nanoseconds))
@@ -659,6 +659,38 @@ enum PlatformScheduler {
                 creationTime: FileTime(timespec: creationTime)
             )
         }
+
+        init(rawValue: stat) {
+            // Preserve the bit pattern: dev_t may be signed or unsigned
+            // depending on the platform.
+            var device: UInt64 = 0
+            withUnsafeBytes(of: rawValue.st_dev) { bytes in
+                let copyCount = min(bytes.count, MemoryLayout<UInt64>.size)
+                withUnsafeMutableBytes(of: &device) { deviceBytes in
+                    deviceBytes.prefix(copyCount).copyBytes(from: bytes.prefix(copyCount))
+                }
+            }
+            #if canImport(Darwin)
+                let accessTime = rawValue.st_atimespec
+                let modificationTime = rawValue.st_mtimespec
+                let creationTime = rawValue.st_ctimespec
+            #else
+                let accessTime = rawValue.st_atim
+                let modificationTime = rawValue.st_mtim
+                let creationTime = rawValue.st_ctim
+            #endif
+            self.init(
+                device: device,
+                inode: UInt64(rawValue.st_ino),
+                fileType: FileDescriptor.FileType(mode: rawValue.st_mode),
+                linkCount: UInt64(rawValue.st_nlink),
+                size: Int64(rawValue.st_size),
+                accessTime: FileTime(timespec: accessTime),
+                modificationTime: FileTime(timespec: modificationTime),
+                creationTime: FileTime(timespec: creationTime)
+            )
+        }
+
     }
 
     extension FileDescriptor.DirectoryEntry {

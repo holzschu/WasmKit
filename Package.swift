@@ -30,6 +30,7 @@ let cliCommandsTarget = Target.target(
         "WasmKitWASI",
         "WasmKitWASIThreads",
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "SystemPackage", package: "swift-system"),
     ],
     exclude: ["CMakeLists.txt"],
     swiftSettings: swiftSettings
@@ -45,6 +46,7 @@ let cliCommandsTestTarget = Target.testTarget(
         "WasmKit",
         "WasmKitWASI",
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "SystemPackage", package: "swift-system"),
     ],
     exclude: ["Fixtures"]
 )
@@ -199,6 +201,7 @@ let package = Package(
             name: "WASI",
             dependencies: [
                 "WasmTypes",
+                .product(name: "SystemPackage", package: "swift-system"),
                 .target(name: "CWASIPlatform", condition: .when(platforms: [.wasi])),
             ],
             exclude: ["CMakeLists.txt"],
@@ -215,6 +218,7 @@ let package = Package(
             dependencies: [
                 "WasmKit",
                 "WasmKitWASI",
+                .product(name: "SystemPackage", package: "swift-system"),
             ],
             swiftSettings: swiftSettings
         ),
@@ -348,6 +352,7 @@ if ProcessInfo.processInfo.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {
     package.dependencies += [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.1"),
         .package(url: "https://github.com/swiftlang/swift-syntax", "600.0.0"..<"605.0.0"),
+        .package(url: "https://github.com/apple/swift-system", from: "1.7.2"),
     ]
 } else {
     package.dependencies += [

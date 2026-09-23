@@ -1,4 +1,5 @@
 import WasmTypes
+import ios_system
 
 @_spi(WASIPlatform) public enum WASIAbi {
     public enum Errno: UInt16, Error, GuestPointee {
@@ -712,6 +713,19 @@ import WasmTypes
     /// Number of hard links to an inode.
     public typealias LinkCount = UInt64
 
+    /**
+     * File attributes.
+    typedef struct __wasi_filestat_t {
+        __wasi_device_t dev;
+        __wasi_inode_t ino;
+        __wasi_filetype_t filetype;
+        __wasi_linkcount_t nlink;
+        __wasi_filesize_t size;
+        __wasi_timestamp_t atim;
+        __wasi_timestamp_t mtim;
+        __wasi_timestamp_t ctim;
+    } __wasi_filestat_t; */
+
     /// File attributes.
     public struct Filestat: GuestPrimitivePointee {
         /// Device ID of device containing the file.
@@ -859,6 +873,7 @@ final class WASIImplementation: Sendable {
 
     /// Look up a directory entry by WASI fd, throwing EBADF if the fd doesn't
     /// exist or ENOTDIR if it exists but isn't a directory.
+    /// a-Shell: keep that function, but make sure all directories opened are stored in the fdTable.
     private func directoryEntry(fd: WASIAbi.Fd) throws -> any WASIDir {
         guard let entry = fdTable.withLock({ $0[fd] }) else {
             throw WASIAbi.Errno.EBADF
@@ -1012,6 +1027,36 @@ final class WASIImplementation: Sendable {
     /// Get the attributes of a file descriptor.
     /// - Parameter fileDescriptor: File descriptor to get attribute.
     func fd_fdstat_get(fileDescriptor: UInt32) throws -> WASIAbi.FdStat {
+        #if os(iOS)
+        // a-Shell: make sure standard descriptors appear as a TTY... if they are.
+        // ios_isatty handles 0, file(stdin), fileno(thread_stdin)...
+        if ios_isatty(Int32(fileDescriptor)) != 0 {
+            // fdstat->fs_filetype = __WASI_FILETYPE_CHARACTER_DEVICE;
+            // fdstat->fs_rights_base = (uint64_t)-1; // all rights
+            // fdstat->fs_rights_base &= ~(__WASI_RIGHTS_FD_SEEK | __WASI_RIGHTS_FD_TELL);
+            // fdstat->fs_rights_inheriting = (uint64_t)-1; // all rights
+            // m3ApiReturn(__WASI_ERRNO_SUCCESS);
+            return WASIAbi.FdStat(
+                fsFileType: .CHARACTER_DEVICE,
+                fsFlags: [],
+                // all rights, except FD_SEEK and FD_TELL
+                fsRightsBase: .DIRECTORY_BASE_RIGHTS.union([
+                    .FD_DATASYNC,
+                    .FD_READ,
+                    .FD_FDSTAT_SET_FLAGS,
+                    .FD_SYNC,
+                    .FD_WRITE,
+                    .FD_ADVISE,
+                    .FD_ALLOCATE,
+                    .FD_FILESTAT_GET,
+                    .FD_FILESTAT_SET_SIZE,
+                    .FD_FILESTAT_SET_TIMES,
+                    .POLL_FD_READWRITE,
+                ]),
+                fsRightsInheriting: .DIRECTORY_INHERITING_RIGHTS // all rights
+            )
+        }
+        #endif
         let entry = fdTable.withLock { table in table[fileDescriptor] }
         switch entry {
         case .file(let entry):
@@ -1050,6 +1095,21 @@ final class WASIImplementation: Sendable {
 
     /// Return the attributes of an open file.
     func fd_filestat_get(fd: WASIAbi.Fd) throws -> WASIAbi.Filestat {
+        #if os(iOS)
+        // a-Shell: call fstat directly, convert into fileStat structure
+        // TODO: change this with Swift 6.4 / Xcode 27
+        let rawFd = try fdTable.withLock { table -> Int32 in
+            return try table.fileDescriptor(fd: fd)
+        }
+        var fd_stat = stat()
+        let returnValue = fstat(rawFd, &fd_stat);
+        if (returnValue == 0) {
+            NSLog("WK fd_filestat_get: \(rawFd) size: \(fd_stat.st_size)")
+            return WASIAbi.Filestat(stat: FileDescriptor.Attributes(rawValue: fd_stat))
+        } else {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #endif
         let entry = try fdTable.withLock { table -> FdEntry in
             guard let entry = table[fd] else {
                 throw WASIAbi.Errno.EBADF
@@ -1075,13 +1135,31 @@ final class WASIImplementation: Sendable {
         fd: WASIAbi.Fd, atim: WASIAbi.Timestamp, mtim: WASIAbi.Timestamp,
         fstFlags: WASIAbi.FstFlags
     ) throws {
+        NSLog("WK fd_filestat_set_times: fd= \(fd) to \(atim) / \(mtim)")
         let entry = try fdTable.withLock { table -> FdEntry in
             guard let entry = table[fd] else {
                 throw WASIAbi.Errno.EBADF
             }
             return entry
         }
+        #if os(iOS)
+        let rawFd = try fdTable.withLock { table -> Int32 in
+            return try table.fileDescriptor(fd: fd)
+        }
+        let (access, modification) = try WASIAbi.Timestamp.platformTimeSpec(
+            atim: atim, mtim: mtim, fstFlags: fstFlags
+        )
+        NSLog("WK fd_filestat_set_times: access= \(access) modification \(modification) entry= \(entry) fileDescriptor= \(rawFd)")
+        let times = ContiguousArray([_posixTimespec(access), _posixTimespec(modification)])
+        return try times.withUnsafeBufferPointer { timesPtr in
+            if (futimens(rawFd, timesPtr.baseAddress) != 0) {
+                throw try WASIAbi.Errno(platformErrno: errno)
+            }
+            NSLog("WK fd_filestat_set_times: did set times access= \(Date(timeIntervalSince1970: TimeInterval(access.seconds))) modification \(Date(timeIntervalSince1970: TimeInterval(modification.seconds))) ")
+        }
+        #else
         try entry.asEntry().setTimes(atim: atim, mtim: mtim, fstFlags: fstFlags)
+        #endif
     }
 
     /// Read from a file descriptor, without using and updating the file descriptor's offset.
@@ -1101,28 +1179,37 @@ final class WASIImplementation: Sendable {
 
     /// Return a description of the given preopened file descriptor.
     func fd_prestat_get(fd: WASIAbi.Fd) throws -> WASIAbi.Prestat {
+        NSLog("WK fd_prestat_get: fd= \(fd)")
         let preopenPath = try fdTable.withLock { table -> String in
             guard case .directory(let entry) = table[fd],
                 let preopenPath = entry.preopenPath
             else {
+                NSLog("WK fd_prestat_get: throwing EBADF, entry is not a directory")
                 throw WASIAbi.Errno.EBADF
             }
+            NSLog("WK fd_prestat_get: found preopenPath \(preopenPath)")
             return preopenPath
         }
+        NSLog("WK fd_prestat_get: calling PrestatDir")
         return .dir(WASIAbi.PrestatDir(preopenPath.utf8.count))
     }
 
     /// Return a directory name of the given preopened file descriptor
     func fd_prestat_dir_name<M: GuestMemory>(fd: WASIAbi.Fd, path: UnsafeGuestPointer<UInt8>, maxPathLength: WASIAbi.Size, memory: M) throws {
+        NSLog("WK fd_prestat_dir_name (1): fd= \(fd)")
+
         var preopenPath = try fdTable.withLock { table -> String in
             guard case .directory(let entry) = table[fd],
                 let preopenPath = entry.preopenPath
             else {
+                NSLog("WK fd_prestat_dir_name (2) throwing EBADF")
                 throw WASIAbi.Errno.EBADF
             }
+            NSLog("WK fd_prestat_dir_name (2): found preopenPath \(String(preopenPath))")
             return preopenPath
         }
 
+        NSLog("WK fd_prestat_dir_name (3): found preopenPath \(String(preopenPath))")
         try preopenPath.withUTF8 { bytes in
             guard bytes.count <= maxPathLength else {
                 throw WASIAbi.Errno.ENAMETOOLONG
@@ -1132,6 +1219,7 @@ final class WASIImplementation: Sendable {
             path.withHostPointer(in: memory, count: bytes.count) { buffer in
                 UnsafeMutableRawBufferPointer(buffer).copyBytes(from: bytes)
             }
+            NSLog("WK fd_prestat_dir_name: path = \(path)") // and then what?
         }
     }
 
@@ -1176,44 +1264,52 @@ final class WASIImplementation: Sendable {
             from dirEntry: any WASIDir
         ) throws -> WASIAbi.Size {
             var entries = try dirEntry.readEntries(cookie: cookie)
+            NSLog("WK readdir entries found: \(entries)")
             defer { entries.close() }
             var bufferUsed: WASIAbi.Size = 0
             let totalBufferSize = buffer.count
             while let result = entries.next() {
-                var (entry, name) = try result.get()
                 do {
-                    // 1. Copy dirent to the buffer
-                    // Copy dirent as much as possible even though the buffer doesn't have enough remaining space
-                    let copyingBytes = min(WASIAbi.Dirent.sizeInGuest, totalBufferSize - bufferUsed)
-                    let rangeStart = buffer.baseAddress.raw.advanced(by: bufferUsed)
-                    let rangeEnd = rangeStart.advanced(by: copyingBytes)
-                    WASIAbi.Dirent.writeToGuest(unalignedAt: rangeStart, end: rangeEnd, in: memory, value: entry)
-                    bufferUsed += copyingBytes
-
-                    // bail out if the remaining buffer space is not enough
-                    if copyingBytes < WASIAbi.Dirent.sizeInGuest {
-                        return totalBufferSize
-                    }
-                }
-
-                do {
-                    // 2. Copy name string to the buffer
-                    // Same truncation rule applied as above
-                    let copyingBytes = min(entry.dirNameLen, totalBufferSize - bufferUsed)
-                    let rangeStart = buffer.baseAddress.raw.advanced(by: bufferUsed)
-                    name.withUTF8 { bytes in
-                        rangeStart.withHostPointer(in: memory, count: Int(copyingBytes)) { hostBuffer in
-                            hostBuffer.copyMemory(
-                                from: UnsafeRawBufferPointer(start: bytes.baseAddress, count: Int(copyingBytes))
-                            )
+                    // Some entries in ~ are not permitted. We just don't display them.
+                    var (entry, name) = try result.get()
+                    NSLog("WK readdir current: \(entry) = \(name)")
+                    do {
+                        // 1. Copy dirent to the buffer
+                        // Copy dirent as much as possible even though the buffer doesn't have enough remaining space
+                        let copyingBytes = min(WASIAbi.Dirent.sizeInGuest, totalBufferSize - bufferUsed)
+                        let rangeStart = buffer.baseAddress.raw.advanced(by: bufferUsed)
+                        let rangeEnd = rangeStart.advanced(by: copyingBytes)
+                        WASIAbi.Dirent.writeToGuest(unalignedAt: rangeStart, end: rangeEnd, in: memory, value: entry)
+                        bufferUsed += copyingBytes
+                        
+                        // bail out if the remaining buffer space is not enough
+                        if copyingBytes < WASIAbi.Dirent.sizeInGuest {
+                            return totalBufferSize
                         }
                     }
-                    bufferUsed += copyingBytes
-
-                    // bail out if the remaining buffer space is not enough
-                    if copyingBytes < entry.dirNameLen {
-                        return totalBufferSize
+                    
+                    do {
+                        // 2. Copy name string to the buffer
+                        // Same truncation rule applied as above
+                        let copyingBytes = min(entry.dirNameLen, totalBufferSize - bufferUsed)
+                        let rangeStart = buffer.baseAddress.raw.advanced(by: bufferUsed)
+                        name.withUTF8 { bytes in
+                            rangeStart.withHostPointer(in: memory, count: Int(copyingBytes)) { hostBuffer in
+                                hostBuffer.copyMemory(
+                                    from: UnsafeRawBufferPointer(start: bytes.baseAddress, count: Int(copyingBytes))
+                                )
+                            }
+                        }
+                        bufferUsed += copyingBytes
+                        
+                        // bail out if the remaining buffer space is not enough
+                        if copyingBytes < entry.dirNameLen {
+                            return totalBufferSize
+                        }
                     }
+                }
+                catch {
+                    NSLog("Unable to read entry \(result)")
                 }
             }
             return bufferUsed
@@ -1221,6 +1317,7 @@ final class WASIImplementation: Sendable {
 
         let dirEntry = try fdTable.withLock { table -> any WASIDir in
             guard case .directory(let dirEntry) = table[fd] else {
+                NSLog("WK fd_readdir: unknown directory")
                 throw WASIAbi.Errno.EBADF
             }
             return dirEntry
@@ -1304,18 +1401,52 @@ final class WASIImplementation: Sendable {
 
     /// Create a directory.
     func path_create_directory(dirFd: WASIAbi.Fd, path: String) throws {
+        #if os(iOS)
+        var actualPath = path
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if path.hasPrefix("private/var/mobile") || path.hasPrefix("var/mobile") {
+            actualPath = "/" + path
+        }
+        if (mkdir(actualPath, S_IRWXU|S_IRWXG|S_IRWXO) != 0) {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         let dirEntry = try directoryEntry(fd: dirFd)
         try dirEntry.createDirectory(atPath: path)
+        #endif
     }
 
     /// Return the attributes of a file or directory.
     func path_filestat_get(
         dirFd: WASIAbi.Fd, flags: WASIAbi.LookupFlags, path: String
     ) throws -> WASIAbi.Filestat {
+        NSLog("WK path_filestat_get: path = \(path) dirFd = \(dirFd)")
+        #if os(iOS)
+        // a-Shell: call stat directly, convert into fileStat structure
+        // TODO: change this with Swift 6.4 / Xcode 27
+        var fd_stat = stat()
+        var returnValue: Int32 = 0
+        var actualPath = path
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+            actualPath = "/" + path
+        }
+        if flags.contains(.SYMLINK_FOLLOW) {
+            returnValue = stat(actualPath, &fd_stat)
+        } else {
+            returnValue = lstat(actualPath, &fd_stat)
+        }
+        if (returnValue == 0) {
+            return WASIAbi.Filestat(stat: FileDescriptor.Attributes(rawValue: fd_stat))
+        } else {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         let dirEntry = try directoryEntry(fd: dirFd)
         return try dirEntry.attributes(
             path: path, symlinkFollow: flags.contains(.SYMLINK_FOLLOW)
         )
+        #endif
     }
 
     /// Adjust the timestamps of a file or directory.
@@ -1324,6 +1455,36 @@ final class WASIImplementation: Sendable {
         path: String, atim: WASIAbi.Timestamp, mtim: WASIAbi.Timestamp,
         fstFlags: WASIAbi.FstFlags
     ) throws {
+        NSLog("WK path_filestat_set_times: path= \(path)")
+        #if os(iOS)
+        // at this point, fd is either the directory file descriptor or AT_FDCWD
+        var myFd:Int32 = 0
+        do {
+            let dirEntry = try directoryEntry(fd: dirFd)
+            myFd = Int32(dirFd)
+        }
+        catch {
+            myFd = AT_FDCWD
+        }
+        let (access, modification) = try WASIAbi.Timestamp.platformTimeSpec(
+            atim: atim, mtim: mtim, fstFlags: fstFlags
+        )
+        var myFlags: Int32 = 0;
+        if !flags.contains(.SYMLINK_FOLLOW) {
+            myFlags |= AT_SYMLINK_NOFOLLOW
+        }
+        let times = ContiguousArray([_posixTimespec(access), _posixTimespec(modification)])
+        var actualPath = path
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+            actualPath = "/" + path
+        }
+        return try times.withUnsafeBufferPointer { timesPtr in
+            if (utimensat(myFd, actualPath, timesPtr.baseAddress, myFlags) != 0) {
+                throw try WASIAbi.Errno(platformErrno: errno)
+            }
+        }
+        #endif
         let dirEntry = try directoryEntry(fd: dirFd)
         try dirEntry.setFilestatTimes(
             path: path, atim: atim, mtim: mtim,
@@ -1337,7 +1498,24 @@ final class WASIImplementation: Sendable {
         oldFd: WASIAbi.Fd, oldFlags: WASIAbi.LookupFlags, oldPath: String,
         newFd: WASIAbi.Fd, newPath: String
     ) throws {
+        #if os(iOS)
+        var actualOldPath = oldPath
+        var actualNewPath = newPath
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !oldPath.hasPrefix("/") && !FileManager().fileExists(atPath: oldPath) && FileManager().fileExists(atPath: "/" + oldPath) {
+            actualOldPath = "/" + oldPath
+        }
+        if newPath.hasPrefix("private/var/mobile") || newPath.hasPrefix("var/mobile") {
+            actualNewPath = "/" + newPath
+        }
+        if (linkat(Int32(oldFd), actualOldPath, Int32(newFd), actualNewPath, Int32(oldFlags.rawValue)) == 0) {
+            return
+        } else {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         throw WASIAbi.Errno.ENOTSUP
+        #endif
     }
 
     /// Open a file or directory.
@@ -1356,29 +1534,64 @@ final class WASIImplementation: Sendable {
         fdflags: WASIAbi.Fdflags
     ) throws -> WASIAbi.Fd {
         try fdTable.withLock { table in
+            NSLog("WK path_open: path = \(path)")
+            var actualPath = path
+            #if os(iOS)
+            // 0-1-2 are reserved for stdio
+            // "3" is the first path opened, so it must be "/"
+            // TODO: it would be better to scan the table,to make sure we have "/"
+            guard case .directory(let dirEntry) = table[3] else {
+                throw WASIAbi.Errno.ENOTDIR
+            }
+            // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+            if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+                actualPath = "/" + path
+            }
+            #else
             guard case .directory(let dirEntry) = table[dirFd] else {
                 throw WASIAbi.Errno.ENOTDIR
             }
+            #endif
             guard table.hasCapacity else {
+                NSLog("WK path_open: table has no capacity")
                 throw WASIAbi.Errno.ENFILE
             }
+            NSLog("WK path_open: dirEntry: \(dirEntry)")
             let newEntry = try fileSystem.openAt(
                 dirFd: dirEntry,
-                path: path,
+                path: actualPath,
                 oflags: oflags,
                 fsRightsBase: fsRightsBase,
                 fsRightsInheriting: fsRightsInheriting,
                 fdflags: fdflags,
                 symlinkFollow: dirFlags.contains(.SYMLINK_FOLLOW)
             )
+            NSLog("WK path_open: created new Entry: \(newEntry)")
             return try table.push(newEntry)
         }
     }
 
     /// Read the contents of a symbolic link.
     func path_readlink<M: GuestMemory>(fd: WASIAbi.Fd, path: String, buffer: UnsafeGuestBufferPointer<UInt8>, memory: M) throws -> WASIAbi.Size {
+        #if os(iOS)
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        var actualPath = path
+        if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+            actualPath = "/" + path
+        }
+        let linkedFile = try FileManager().destinationOfSymbolicLink(atPath: actualPath)
+        let linkBytes: [UInt8] = Array(linkedFile.utf8)
+        let bytesWritten = min(Int(buffer.count), linkBytes.count)
+        if bytesWritten > 0 {
+            buffer.withHostPointer(in: memory) { hostBuffer in
+                linkBytes.withUnsafeBytes { linkBytes in
+                    guard let source = linkBytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                    hostBuffer.baseAddress?.update(from: source, count: bytesWritten)
+                }
+            }
+        }
+        #else
         let dirEntry = try directoryEntry(fd: fd)
-
         let linkBytes = try dirEntry.readlink(atPath: path)
         let bytesWritten = min(Int(buffer.count), linkBytes.count)
         if bytesWritten > 0 {
@@ -1391,13 +1604,24 @@ final class WASIImplementation: Sendable {
                 }
             }
         }
+        #endif
         return WASIAbi.Size(bytesWritten)
     }
 
     /// Remove a directory.
     func path_remove_directory(dirFd: WASIAbi.Fd, path: String) throws {
+        #if os(iOS)
+        var actualPath = path
+        if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+            actualPath = "/" + path
+        }
+        if (rmdir(actualPath) != 0) {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         let dirEntry = try directoryEntry(fd: dirFd)
         try dirEntry.removeDirectory(atPath: path)
+        #endif
     }
 
     /// Rename a file or directory.
@@ -1405,21 +1629,85 @@ final class WASIImplementation: Sendable {
         oldFd: WASIAbi.Fd, oldPath: String,
         newFd: WASIAbi.Fd, newPath: String
     ) throws {
+        #if os(iOS)
+        var actualOldPath = oldPath
+        var actualNewPath = newPath
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !oldPath.hasPrefix("/") && !FileManager().fileExists(atPath: oldPath) && FileManager().fileExists(atPath: "/" + oldPath) {
+            actualOldPath = "/" + oldPath
+        }
+        if newPath.hasPrefix("private/var/mobile") || newPath.hasPrefix("var/mobile") {
+            actualNewPath = "/" + newPath
+        }
+        do {
+            if (FileManager().fileExists(atPath: actualNewPath)) {
+                do {
+                    try FileManager().removeItem(atPath: actualNewPath)
+                }
+                catch {
+                }
+            }
+            try FileManager().moveItem(atPath:actualOldPath, toPath: actualNewPath)
+        }
+        catch {
+            let error = (error as NSError)
+            if let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                throw try WASIAbi.Errno(platformErrno: CInt(underlyingError.code))
+            } else {
+                throw try WASIAbi.Errno(platformErrno: CInt(error.code))
+            }
+        }
+        #else
         let oldDirEntry = try directoryEntry(fd: oldFd)
         let newDirEntry = try directoryEntry(fd: newFd)
         try oldDirEntry.rename(from: oldPath, toDir: newDirEntry, to: newPath)
+        #endif
     }
 
     /// Create a symbolic link.
     func path_symlink(oldPath: String, dirFd: WASIAbi.Fd, newPath: String) throws {
+        #if os(iOS)
+        var actualOldPath = oldPath
+        var actualNewPath = newPath
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !oldPath.hasPrefix("/") && !FileManager().fileExists(atPath: oldPath) && FileManager().fileExists(atPath: "/" + oldPath) {
+            actualOldPath = "/" + oldPath
+        }
+        if newPath.hasPrefix("private/var/mobile") || newPath.hasPrefix("var/mobile") {
+            actualNewPath = "/" + newPath
+        }
+        do {
+            try FileManager().createSymbolicLink(atPath: actualNewPath, withDestinationPath: actualOldPath)
+        }
+        catch {
+            let error = (error as NSError)
+            if let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                throw try WASIAbi.Errno(platformErrno: CInt(underlyingError.code))
+            } else {
+                throw try WASIAbi.Errno(platformErrno: CInt(error.code))
+            }
+        }
+        #else
         let dirEntry = try directoryEntry(fd: dirFd)
         try dirEntry.symlink(from: oldPath, to: newPath)
+        #endif
     }
 
     /// Unlink a file.
     func path_unlink_file(dirFd: WASIAbi.Fd, path: String) throws {
+        #if os(iOS)
+        var actualPath = path
+        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
+        if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
+            actualPath = "/" + path
+        }
+        if (unlink(actualPath) != 0) {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         let dirEntry = try directoryEntry(fd: dirFd)
         try dirEntry.removeFile(atPath: path)
+        #endif
     }
 
     /// Concurrently poll for the occurrence of a set of events.

@@ -1,4 +1,5 @@
 import WasmTypes
+import ios_system
 
 /// Wraps an implementation so thrown ``WASIAbi/Errno`` values surface as the
 /// errno return value the ABI expects.
@@ -198,6 +199,7 @@ extension WASIImplementation {
         preview1["fd_read"] = wasiFunction(
             type: .init(parameters: [.i32, .i32, .i32, .i32], results: [.i32])
         ) { caller, arguments in
+            NSLog("WK fd_read: fd= \(arguments[0].i32) base= \(arguments[1].i32) size= \(arguments[2].i32) ")
             try withMemoryBuffer(caller: caller) { buffer in
                 let nread = try self.fd_read(
                     fd: arguments[0].i32,
@@ -207,6 +209,7 @@ extension WASIImplementation {
                     ),
                     memory: buffer
                 )
+                NSLog("WK fd_read: result= \(nread) ")
                 let nreadPointer = UnsafeGuestPointer<WASIAbi.Size>(offset: arguments[3].i32)
                 nreadPointer.write(nread, to: buffer)
             }
@@ -244,6 +247,7 @@ extension WASIImplementation {
         preview1["fd_seek"] = wasiFunction(
             type: .init(parameters: [.i32, .i64, .i32, .i32], results: [.i32])
         ) { caller, arguments in
+            NSLog("WK fd_seek, fd= \(arguments[0].i32) offset= \(arguments[1].i64) ")
             guard let rawWhence = UInt8(exactly: arguments[2].i32),
                 let whence = WASIAbi.Whence(rawValue: rawWhence)
             else {
@@ -260,6 +264,7 @@ extension WASIImplementation {
         }
 
         preview1["fd_tell"] = wasiFunction(type: .init(parameters: [.i32, .i32], results: [.i32])) { caller, arguments in
+            NSLog("WK fd_tell, fd= \(arguments[0].i32)")
             let ret = try self.fd_tell(fd: arguments[0].i32)
             try withMemoryBuffer(caller: caller) { buffer in
                 let retPointer = UnsafeGuestPointer<WASIAbi.FileSize>(offset: arguments[1].i32)
@@ -269,6 +274,7 @@ extension WASIImplementation {
         }
 
         preview1["fd_sync"] = wasiFunction(type: .init(parameters: [.i32], results: [.i32])) { caller, arguments in
+            NSLog("WK fd_sync, fd= \(arguments[0].i32)")
             try self.fd_sync(fd: arguments[0].i32)
             return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
         }
@@ -355,6 +361,7 @@ extension WASIImplementation {
         preview1["fd_pread"] = wasiFunction(
             type: .init(parameters: [.i32, .i32, .i32, .i64, .i32], results: [.i32])
         ) { caller, arguments in
+            NSLog("WK fd_pread, fd= \(arguments[0].i32) offset= \(arguments[1].i32) count= \(arguments[2].i32)")
             try withMemoryBuffer(caller: caller) { buffer in
                 let nread = try self.fd_pread(
                     fd: arguments[0].i32,
@@ -413,6 +420,7 @@ extension WASIImplementation {
 
         preview1["fd_readdir"] = wasiFunction(type: .init(parameters: [.i32, .i32, .i32, .i64, .i32], results: [.i32])) { caller, arguments in
             try withMemoryBuffer(caller: caller) { buffer in
+                NSLog("WK fd_readdir (external). fd= \(arguments[0].i32)")
                 let nwritten = try self.fd_readdir(
                     fd: arguments[0].i32,
                     buffer: UnsafeGuestBufferPointer<UInt8>(
@@ -455,6 +463,7 @@ extension WASIImplementation {
                     dirFd: arguments[0].i32, flags: .init(rawValue: arguments[1].i32),
                     path: readString(pointer: arguments[2].i32, length: arguments[3].i32, buffer: buffer)
                 )
+                NSLog("WK path_filestat_get result: \(filestat) size= \(filestat.size) offset: \(arguments[4].i32)")
                 let filestatPointer = UnsafeGuestPointer<WASIAbi.Filestat>(offset: arguments[4].i32)
                 filestatPointer.write(filestat, to: buffer)
             }
@@ -504,6 +513,7 @@ extension WASIImplementation {
                     fsRightsInheriting: .init(rawValue: arguments[6].i64),
                     fdflags: .init(rawValue: rawFdFlags)
                 )
+                NSLog("WK path_open result: \(newFd)")
                 let newFdPointer = UnsafeGuestPointer<WASIAbi.Fd>(offset: arguments[8].i32)
                 newFdPointer.write(newFd, to: buffer)
                 return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
@@ -619,6 +629,82 @@ extension WASIImplementation {
             try self.sock_shutdown(fd: arguments[0].i32)
             return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
         }
+        
+        // a-Shell extra functions: getcwd, chdir, system:
+        preview1["ashell_getcwd"] = wasiFunction(
+            type: .init(parameters: [.i32, .i32, .i32], results: [.i32])
+        )
+        { caller, arguments in
+            try withMemoryBuffer(caller: caller) { buffer in
+                // i(*ii)
+                // buf, bufLen, bufused
+                let path_len = Int(arguments[1].i32)
+                var path = [Int8](repeating: 0, count: path_len)
+                getcwd(&path, path_len);
+
+                // is "buffer" in path_readlink
+                let retPointer =  UnsafeGuestBufferPointer<UInt8>(
+                    baseAddress: .init(offset: arguments[0].i32),
+                    count: arguments[1].i32)
+                // and "memory" is buffer, "linkBytes" should be path
+                let bytesWritten = min(Int(path.count), path_len)
+                if bytesWritten > 0 {
+                    retPointer.withHostPointer(in: buffer) { hostBuffer in
+                        path.withUnsafeBytes { path in
+                            guard let source = path.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                            hostBuffer.baseAddress?.update(from: source, count: bytesWritten)
+                        }
+                    }
+                }
+                NSLog("wasmkit ashell_getcwd: \(path)")
+
+                let retPointerSize = UnsafeGuestPointer<WASIAbi.Size>(offset: arguments[2].i32)
+                retPointerSize.write(WASIAbi.Size(bytesWritten), to: buffer)
+                
+                return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
+            }
+        }
+
+        preview1["ashell_chdir"] = wasiFunction(
+            type: .init(parameters: [.i32, .i32], results: [.i32])
+        )
+        { caller, arguments in
+            try withMemoryBuffer(caller: caller) { buffer in
+                // i(*i)
+                // buf, bufLen
+                if (chdir(try readString(pointer: arguments[0].i32, length: arguments[1].i32, buffer: buffer)) == 0) {
+                    return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
+                }
+                throw try WASIAbi.Errno(platformErrno: errno)
+            }
+        }
+
+        preview1["ashell_system"] = wasiFunction(
+            type: .init(parameters: [.i32, .i32], results: [.i32])
+        )
+        { caller, arguments in
+            try withMemoryBuffer(caller: caller) { buffer in
+                // i(*i)
+                // command, commandLen
+                let pid = ios_fork();
+                NSLog("wasmkit ashell_system")
+
+                var result = ios_system(try readString(pointer: arguments[0].i32, length: arguments[1].i32, buffer: buffer));
+                ios_waitpid(pid);
+                ios_releaseThreadId(pid);
+                if (result == 0) {
+                    // If there's already been an error (e.g. "command not found") no need to ask for more.
+                    result = ios_getCommandStatus();
+                }
+                if (result == 0) {
+                    return [.i32(.init(WASIAbi.Errno.SUCCESS.rawValue))]
+                }
+                                
+                NSLog("wasmkit ashell_system error: \(result)")
+                throw try WASIAbi.Errno(platformErrno: result)
+            }
+        }
+        
 
         return preview1
     }
@@ -678,6 +764,9 @@ let preview1Signatures: [(name: String, type: FunctionType)] = [
     ("sock_recv", .init(parameters: [.i32, .i32, .i32, .i32, .i32, .i32], results: [.i32])),
     ("sock_send", .init(parameters: [.i32, .i32, .i32, .i32, .i32], results: [.i32])),
     ("sock_shutdown", .init(parameters: [.i32, .i32], results: [.i32])),
+    ("ashell_getcwd", .init(parameters: [.i32, .i32, .i32], results: [.i32])),
+    ("ashell_chdir", .init(parameters: [.i32, .i32], results: [.i32])),
+    ("ashell_system", .init(parameters: [.i32, .i32], results: [.i32]))
 ]
 
 /// A group of `wasi_snapshot_preview1` functions that can be linked on its own.

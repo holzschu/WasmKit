@@ -1,4 +1,5 @@
 import _CWasmKit
+import Foundation
 
 /// An execution state of an invocation of exported function.
 ///
@@ -701,6 +702,7 @@ extension Execution {
                 // Manually release the error object because the trap is caught in C and
                 // held as a raw pointer.
                 wasmkit_swift_errorRelease(rawError)
+                NSLog("after wasmkit_swift_errorRelease") // this line is necessary to avoid a crash
                 self.resetError()
 
                 if let exception = error as? WasmKitException {

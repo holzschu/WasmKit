@@ -1,3 +1,4 @@
+import Foundation
 import WasmTypes
 
 struct DirEntry {
@@ -65,6 +66,28 @@ extension DirEntry: WASIDir, FdWASIEntry {
             mode = .readOnly
         }
 
+        #if os(iOS)
+        var localMode: Int32 = Int32(options.rawValue)
+        switch (mode) {
+        case .readOnly:
+            localMode |= O_RDONLY
+        case .writeOnly:
+            localMode |= O_WRONLY
+        case .readWrite:
+            localMode |= O_RDWR
+        }
+        let newFd_fd = open(path, localMode)
+        // NSLog("opening path= \(path) mode: \(mode.rawValue) O_WRONLY= \(O_WRONLY) options: \(options.rawValue) new fd: \(newFd_fd)")
+        if (newFd_fd > 0) {
+            if (options.contains(.create)) {
+                // make sure the new file is created with rw-r--r-- permissions
+                fchmod(newFd_fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+            }
+            return FileDescriptor(rawValue: newFd_fd)
+        } else {
+            throw try WASIAbi.Errno(platformErrno: errno)
+        }
+        #else
         let newFd = try SandboxPrimitives.openAt(
             start: self.fd,
             path: GuestPath(path), mode: mode, options: options,
@@ -72,6 +95,7 @@ extension DirEntry: WASIDir, FdWASIEntry {
             permissions: .ownerReadWrite
         )
         return newFd
+        #endif
     }
 
     func setFilestatTimes(

@@ -48,7 +48,11 @@ public struct Imports {
 
     /// Lookup a value to be imported by the given module and name.
     func lookup(module: String, name: String) -> (InternalExternalValue, StoreAllocator)? {
-        definitions[module]?[name]?.internalize()
+        if (module == "wasi_unstable") {
+            definitions["wasi_snapshot_preview1"]?[name]?.internalize()
+        } else {
+            definitions[module]?[name]?.internalize()
+        }
     }
 }
 

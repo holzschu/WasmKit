@@ -8,6 +8,14 @@ extension FdTable {
 
         return hostFd
     }
+    
+    func fileDescriptor(fd: WASIAbi.Fd) throws -> CInt {
+        guard case .file(let entry) = self[fd], let hostFd = entry.hostFileDescriptor else {
+            throw WASIAbi.Errno.EBADF
+        }
+        return hostFd
+    }
+    
 }
 
 func poll<M: GuestMemory>(
