@@ -14,11 +14,6 @@ final class HostFileSystem: FileSystemImplementation, Sendable {
 
     func preopenDirectory(guestPath: String, hostPath: String) throws -> any WASIDir {
         let fd: FileDescriptor
-        #if os(iOS)
-        if (guestPath == "/dev") {
-            return DirEntry(preopenPath: "/dev", fd: FileDescriptor(rawValue: 4))
-        }
-        #endif
         do {
             fd = try FileDescriptor.openPreopenDirectory(hostPath)
         } catch {
