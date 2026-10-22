@@ -1661,9 +1661,13 @@ final class WASIImplementation: Sendable {
         if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && FileManager().fileExists(atPath: "/" + path) {
             actualPath = "/" + path
         }
-        let linkedFile = try FileManager().destinationOfSymbolicLink(atPath: actualPath)
-        let linkBytes: [UInt8] = Array(linkedFile.utf8)
-        let bytesWritten = min(Int(buffer.count), linkBytes.count)
+        // Use the POSIX helper from upstream 1d87ccde8ff808bbe27b9f6cadd1132443697aa9
+        // so a non-symlink reports WASI EINVAL instead of a Cocoa error.
+        var linkBytes = [UInt8](repeating: 0, count: max(1, min(Int(buffer.count), FileDescriptor.maximumPathLength)))
+        let count = try linkBytes.withUnsafeMutableBytes { rawBuffer in
+            try FileDescriptor(rawValue: AT_FDCWD).readSymlink(at: actualPath, into: rawBuffer)
+        }
+        let bytesWritten = min(Int(buffer.count), count)
         if bytesWritten > 0 {
             buffer.withHostPointer(in: memory) { hostBuffer in
                 linkBytes.withUnsafeBytes { linkBytes in
