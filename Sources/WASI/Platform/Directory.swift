@@ -67,47 +67,24 @@ extension DirEntry: WASIDir, FdWASIEntry {
         }
 
         #if os(iOS)
-        var localMode: Int32 = Int32(0)
-        if options.contains(.create) {
-            localMode |= O_CREAT
-        }
-        if options.contains(.truncate) {
-            localMode |= O_TRUNC
-        }
-        if options.contains(.append) {
-            localMode |= O_APPEND
-        }
-        if options.contains(.directory) {
-            localMode |= O_DIRECTORY
-        }
-        if options.contains(.exclusiveCreate) {
-            localMode |= O_EXCL
-        }
-        if options.contains(.noFollow) {
-            localMode |= O_NOFOLLOW
-        }
-        switch (mode) {
-        case .readOnly:
-            localMode |= O_RDONLY
-        case .writeOnly:
-            localMode |= O_WRONLY
-        case .readWrite:
-            localMode |= O_RDWR
-        }
-        if (self.fd.rawValue == 4) && path == "tty" {
+        // A sandboxed command can expose /dev/tty through the root preopen
+        // without opening the /dev directory itself.
+        if (preopenPath == "/dev" && path == "tty") ||
+            (preopenPath == "/" && (path == "dev/tty" || path == "/dev/tty")) {
             return FileDescriptor(rawValue: 4) // special case for /dev/tty
         }
-        let newFd_fd = open(path, localMode)
-        NSLog("opened path= \(path) mode: \(localMode) options: \(options.rawValue) new fd: \(newFd_fd)")
-        if (newFd_fd > 0) {
-            if (options.contains(.create)) {
-                // make sure the new file is created with rw-r--r-- permissions
-                fchmod(newFd_fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        let permissions = FileDescriptor.FilePermissions(rawValue: 0o644)
+        // Preserve a-Shell's cwd-relative files for the root preopen. WASI libc
+        // also strips this preopen's slash from absolute paths; resolve a miss
+        // against its descriptor so creating a new absolute file works too.
+        if preopenPath == "/" && !path.hasPrefix("/") {
+            do {
+                return try FileDescriptor.open(path, mode, options: options, permissions: permissions)
+            } catch let error as WASIAbi.Errno {
+                guard error == .ENOENT else { throw error }
             }
-            return FileDescriptor(rawValue: newFd_fd)
-        } else {
-            throw try WASIAbi.Errno(platformErrno: errno)
         }
+        return try fd.open(at: path, mode, options: options, permissions: permissions)
         #else
         let newFd = try SandboxPrimitives.openAt(
             start: self.fd,

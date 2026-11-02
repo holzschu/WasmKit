@@ -1599,49 +1599,17 @@ final class WASIImplementation: Sendable {
     ) throws -> WASIAbi.Fd {
         try fdTable.withLock { table in
             NSLog("WK path_open: path = \(path) oflags: \(oflags) fdflags: \(fdflags) dirFd: \(dirFd) fsRightsBase: \(fsRightsBase)")
-            var actualPath = path
-            #if os(iOS)
-            // 0-1-2 are reserved for stdio
-            // "3" is the first path opened, so it must be "/"
-            // "4" is for /dev/tty
-            // TODO: it would be better to scan the table,to make sure we have "/"
-            guard case .directory(var dirEntry) = table[3] else {
-                throw WASIAbi.Errno.ENOTDIR
-            }
-            // Sometimes, Wasi removes the "/" at the beginning of absolute paths
-            if !path.hasPrefix("/") && !FileManager().fileExists(atPath: path) && !(path == "tty") {
-                if FileManager().fileExists(atPath: "/" + path) {
-                    actualPath = "/" + path
-                } else {
-                    // We also need to account for non-existing files in existing directories:
-                    // TODO: try for other subdirectories above if flags say so;
-                    let enclosingDirectory = URL(fileURLWithPath: "/" + path).deletingLastPathComponent().path
-                    if FileManager().fileExists(atPath: "/" + enclosingDirectory) {
-                        actualPath = "/" + path
-                    }
-                }
-            }
-            if (dirFd == 4) {
-                // specific case for files inside "/dev", including "/dev/tty"
-                guard case .directory(let ttyDirEntry) = table[4] else {
-                    NSLog("WK path_open /dev/tty: throwing")
-                    throw WASIAbi.Errno.ENOTDIR
-                }
-                dirEntry = ttyDirEntry
-            }
-            #else
             guard case .directory(let dirEntry) = table[dirFd] else {
                 throw WASIAbi.Errno.ENOTDIR
             }
-            #endif
             guard table.hasCapacity else {
                 NSLog("WK path_open: table has no capacity")
                 throw WASIAbi.Errno.ENFILE
             }
-            NSLog("WK path_open: dirEntry: \(dirEntry) path= \(actualPath)")
+            NSLog("WK path_open: dirEntry: \(dirEntry) path= \(path)")
             let newEntry = try fileSystem.openAt(
                 dirFd: dirEntry,
-                path: actualPath,
+                path: path,
                 oflags: oflags,
                 fsRightsBase: fsRightsBase,
                 fsRightsInheriting: fsRightsInheriting,
