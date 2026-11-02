@@ -1683,39 +1683,9 @@ final class WASIImplementation: Sendable {
         oldFd: WASIAbi.Fd, oldPath: String,
         newFd: WASIAbi.Fd, newPath: String
     ) throws {
-        #if os(iOS)
-        var actualOldPath = oldPath
-        var actualNewPath = newPath
-        // Sometimes, Wasi removes the "/" at the beginning of absolute paths
-        if !oldPath.hasPrefix("/") && !FileManager().fileExists(atPath: oldPath) && FileManager().fileExists(atPath: "/" + oldPath) {
-            actualOldPath = "/" + oldPath
-        }
-        if newPath.hasPrefix("private/var/mobile") || newPath.hasPrefix("var/mobile") {
-            actualNewPath = "/" + newPath
-        }
-        do {
-            if (FileManager().fileExists(atPath: actualNewPath)) {
-                do {
-                    try FileManager().removeItem(atPath: actualNewPath)
-                }
-                catch {
-                }
-            }
-            try FileManager().moveItem(atPath:actualOldPath, toPath: actualNewPath)
-        }
-        catch {
-            let error = (error as NSError)
-            if let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError {
-                throw try WASIAbi.Errno(platformErrno: CInt(underlyingError.code))
-            } else {
-                throw try WASIAbi.Errno(platformErrno: CInt(error.code))
-            }
-        }
-        #else
         let oldDirEntry = try directoryEntry(fd: oldFd)
         let newDirEntry = try directoryEntry(fd: newFd)
         try oldDirEntry.rename(from: oldPath, toDir: newDirEntry, to: newPath)
-        #endif
     }
 
     /// Create a symbolic link.

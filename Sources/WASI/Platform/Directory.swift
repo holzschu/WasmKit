@@ -7,6 +7,12 @@ struct DirEntry {
 }
 
 extension DirEntry: WASIDir, FdWASIEntry {
+    #if os(iOS)
+        private func isSyntheticTTY(path: String) -> Bool {
+            (preopenPath == "/dev" && path == "tty") || (preopenPath == "/" && (path == "dev/tty" || path == "/dev/tty"))
+        }
+    #endif
+
     func readlink(atPath path: String) throws -> [UInt8] {
         // Capability checking is owned by `SandboxPrimitives.readlinkAt`.
         try SandboxPrimitives.readlinkAt(start: fd, path: path)
@@ -69,8 +75,7 @@ extension DirEntry: WASIDir, FdWASIEntry {
         #if os(iOS)
         // A sandboxed command can expose /dev/tty through the root preopen
         // without opening the /dev directory itself.
-        if (preopenPath == "/dev" && path == "tty") ||
-            (preopenPath == "/" && (path == "dev/tty" || path == "/dev/tty")) {
+        if isSyntheticTTY(path: path) {
             return FileDescriptor(rawValue: 4) // special case for /dev/tty
         }
         let permissions = FileDescriptor.FilePermissions(rawValue: 0o644)
@@ -139,6 +144,23 @@ extension DirEntry: WASIDir, FdWASIEntry {
         }
     }
 
+    #if os(iOS)
+        private func renameParent(path: String) throws -> SplitPath {
+            guard let (parent, basename) = splitParent(path: path) else {
+                throw WASIAbi.Errno.ENOENT
+            }
+            let parentPath = parent.isEmpty ? "." : parent.string
+            guard !isSyntheticTTY(path: parentPath) else {
+                throw WASIAbi.Errno.ENOTDIR
+            }
+            let parentFd = try openFile(
+                symlinkFollow: true, path: parentPath,
+                oflags: .DIRECTORY, accessMode: .read, fdflags: []
+            )
+            return SplitPath(parentFd: parentFd, basename: basename.string, isTemporary: true)
+        }
+    #endif
+
     func rename(from sourcePath: String, toDir newDir: any WASIDir, to destPath: String) throws {
         guard let newDir = newDir as? Self else {
             throw WASIAbi.Errno.EBADF
@@ -153,12 +175,17 @@ extension DirEntry: WASIDir, FdWASIEntry {
         let oldPath = SandboxPrimitives.stripDirSuffix(sourcePath)
         let newPath = SandboxPrimitives.stripDirSuffix(destPath)
 
+        #if os(iOS)
+        let sourceResult = try renameParent(path: oldPath)
+        let destResult = try newDir.renameParent(path: newPath)
+        #else
         let sourceResult = try SandboxPrimitives.openParent(
             start: fd, path: oldPath
         )
         let destResult = try SandboxPrimitives.openParent(
             start: newDir.fd, path: newPath
         )
+        #endif
         try sourceResult.withFields { sourceDir, sourceBasename in
             try destResult.withFields { destDir, destBasename in
                 // Re-append a slash if the original path had one
